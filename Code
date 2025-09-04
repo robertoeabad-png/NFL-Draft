@@ -1,0 +1,415 @@
+import os, zipfile, textwrap, datetime, pandas as pd
+
+base = "/mnt/data/NFL_Draft_Streamlit"
+os.makedirs(base, exist_ok=True)
+
+app_py = r'''import math, os, time, re, json
+import pandas as pd
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+import streamlit as st
+
+st.set_page_config(page_title="NFL Fantasy Draft Assistant", layout="wide")
+
+FP_ADP_URL = "https://www.fantasypros.com/nfl/adp/overall.php"
+FP_PROJ_URLS = {
+    "QB": "https://www.fantasypros.com/nfl/projections/qb.php?week=draft",
+    "RB": "https://www.fantasypros.com/nfl/projections/rb.php?week=draft",
+    "WR": "https://www.fantasypros.com/nfl/projections/wr.php?week=draft",
+    "TE": "https://www.fantasypros.com/nfl/projections/te.php?week=draft",
+}
+NFL_INJ_URL = "https://www.nfl.com/injuries/"
+ESPN_INJ_URL = "https://www.espn.com/nfl/injuries"
+SLEEPER_PLAYERS_URL = "https://api.sleeper.app/v1/players/nfl"
+
+# ---------------------------- Helpers ---------------------------- #
+
+def _safe_get(url, headers=None, params=None, retries=3, timeout=30):
+    headers = headers or {}
+    headers.setdefault("User-Agent", "DraftAssistant/1.0 (+for personal fantasy use)")
+    for i in range(retries):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if i == retries - 1:
+                raise
+            time.sleep(1 + i)
+
+def _norm_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z .'-]", "", str(name)).strip().lower()
+
+def _clean_team(team: str) -> str:
+    return re.sub(r"[^A-Z]", "", str(team)).upper()
+
+# ---------------------------- Fetchers ---------------------------- #
+
+@st.cache_data(ttl=60*30, show_spinner=False)  # cache for 30 minutes
+def fetch_sleeper_players():
+    r = _safe_get(SLEEPER_PLAYERS_URL)
+    data = r.json()
+    rows = []
+    for pid, p in data.items():
+        nm = p.get("full_name") or (p.get("first_name","") + " " + p.get("last_name","")).strip()
+        rows.append({
+            "sleeper_id": pid,
+            "name": nm,
+            "position": (p.get("position") or (p.get("fantasy_positions") or [None])[0]),
+            "team": p.get("team"),
+            "age": p.get("age"),
+            "injury_status": p.get("injury_status"),
+            "injury_body_part": p.get("injury_body_part"),
+            "status": p.get("status"),
+            "name_norm": _norm_name(nm),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_fp_adp():
+    tables = pd.read_html(FP_ADP_URL)
+    if not tables:
+        return pd.DataFrame(columns=["Rank","Player","Team (Bye)","POS","AVG","name_norm"])
+    df = tables[0].copy()
+    df.columns = [c.strip() for c in df.columns]
+    df["Player"] = df["Player"].astype(str)
+    df["name_norm"] = df["Player"].map(_norm_name)
+    for col in ["Sleeper", "RTSports", "AVG", "Real-Time"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "Team (Bye)" in df.columns:
+        df["Team"] = df["Team (Bye)"].str.extract(r"([A-Z]{2,3})")
+    if "POS" in df.columns:
+        df["POS"] = df["POS"].astype(str).str.replace(r"\d+", "", regex=True)
+    return df
+
+def _parse_fp_proj_table(url, pos):
+    r = _safe_get(url)
+    soup = BeautifulSoup(r.text, "lxml")
+    table = soup.find("table")
+    if table is None:
+        try:
+            tbls = pd.read_html(url)
+            if tbls:
+                dfp = tbls[0]
+            else:
+                return pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+    else:
+        headers = [th.get_text(strip=True) for th in table.find("tr").find_all("th")]
+        rows = []
+        for tr in table.find_all("tr")[1:]:
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if not tds or len(tds)<2:
+                continue
+            rows.append(tds[:len(headers)])
+        dfp = pd.DataFrame(rows, columns=headers)
+    # Normalize
+    if "Player" not in dfp.columns:
+        cand = [c for c in dfp.columns if "Player" in c or "Name" in c]
+        if cand:
+            dfp.rename(columns={cand[0]:"Player"}, inplace=True)
+    # Identify fantasy points column
+    fpts_col = None
+    for c in ["FPTS","Fantasy Pts","FantasyPts","PTS"]:
+        if c in dfp.columns:
+            fpts_col = c; break
+    if fpts_col is None:
+        fpts_col = dfp.columns[-1]
+    dfp["FPTS"] = pd.to_numeric(dfp[fpts_col], errors="coerce")
+    dfp["POS"] = pos
+    dfp["name_norm"] = dfp["Player"].map(_norm_name)
+    return dfp[["Player","name_norm","POS","FPTS"]]
+
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_fantasypros_projections():
+    frames = []
+    for pos, url in FP_PROJ_URLS.items():
+        dfp = _parse_fp_proj_table(url, pos)
+        if not dfp.empty:
+            frames.append(dfp)
+    if not frames:
+        return pd.DataFrame(columns=["Player","name_norm","POS","FPTS"])
+    return pd.concat(frames, ignore_index=True)
+
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_injuries():
+    inj = []
+    # NFL.com best-effort
+    try:
+        r = _safe_get(NFL_INJ_URL)
+        soup = BeautifulSoup(r.text, "lxml")
+        for row in soup.select("tr"):
+            cols = [c.get_text(strip=True) for c in row.find_all(["td","th"])]
+            if not cols or len(cols)<3: 
+                continue
+            name = cols[0]; status = cols[-1]
+            if len(name.split())>=2 and status:
+                inj.append({"player": name, "status": status, "source":"NFL.com"})
+    except Exception:
+        pass
+    # ESPN backup
+    try:
+        r2 = _safe_get(ESPN_INJ_URL)
+        soup2 = BeautifulSoup(r2.text, "lxml")
+        for li in soup2.select("section ul li"):
+            txt = li.get_text(" ", strip=True)
+            if " - " in txt:
+                name = txt.split(" - ")[0]
+                status = txt.split(" - ")[-1][:40]
+                if len(name.split())>=2:
+                    inj.append({"player": name, "status": status, "source":"ESPN"})
+    except Exception:
+        pass
+    df = pd.DataFrame(inj)
+    if df.empty:
+        return pd.DataFrame(columns=["player","status","source","name_norm"])
+    df["name_norm"] = df["player"].map(_norm_name)
+    return df
+
+# ---------------------------- Modeling ---------------------------- #
+
+def compute_injury_risk(players_df: pd.DataFrame, inj_df: pd.DataFrame) -> pd.Series:
+    base = pd.Series(0.15, index=players_df.index, dtype=float)
+    age = players_df["age"].fillna(0)
+    pos = players_df["position"].fillna("")
+    bumps = []
+    for a,p in zip(age, pos):
+        bump = 0.0
+        if p in ("RB","WR","TE"):
+            bump += max(0, (a-27))*0.02
+        elif p == "QB":
+            bump += max(0, (a-32))*0.015
+        else:
+            bump += max(0, (a-28))*0.015
+        bumps.append(bump)
+    base += pd.Series(bumps, index=players_df.index)
+    inj_tag = players_df["injury_status"].fillna("").str.lower()
+    base += inj_tag.isin(["out","doubtful"]).astype(float)*0.45
+    base += inj_tag.eq("questionable").astype(float)*0.25
+    if not inj_df.empty:
+        base += players_df["name_norm"].isin(set(inj_df["name_norm"])).astype(float)*0.2
+    return base.clip(0,1)
+
+def availability_probability(adp_overall: float, pick_number: float, spread: float=12.0) -> float:
+    if pd.isna(adp_overall):
+        return 0.5
+    x = (pick_number - adp_overall)/spread
+    return 1.0/(1.0 + math.exp(-x))
+
+def value_over_adp(fpts: float, pos: str, adp_rank: float) -> float:
+    if pd.isna(fpts) or pd.isna(adp_rank):
+        return -1e9
+    pos_weight = {"RB":1.05,"WR":1.0,"TE":0.95,"QB":0.85}.get(pos,0.9)
+    return pos_weight * fpts - 0.15*adp_rank
+
+def categorize(risk: float, upside: float) -> str:
+    if risk <= 0.30 and upside >= 0:
+        return "Secure"
+    if risk >= 0.60 and upside >= 0:
+        return "High Risk / High Return"
+    return "Balanced"
+
+def compute_snake_picks(teams: int, rounds: int, slot: int):
+    picks = []
+    for r in range(1, rounds+1):
+        if r % 2 == 1:
+            picks.append((r-1)*teams + slot)
+        else:
+            picks.append(r*teams - (slot-1))
+    return picks
+
+# ---------------------------- Pipeline ---------------------------- #
+
+def build_data(teams, rounds, slot, targets_per_round):
+    sp = fetch_sleeper_players()
+    adp = fetch_fp_adp()
+    proj = fetch_fantasypros_projections()
+    inj = fetch_injuries()
+
+    merged = pd.merge(proj, sp, how="left", on="name_norm", suffixes=("","_slp"))
+    merged = pd.merge(merged, adp[["name_norm","AVG","POS","Team"]], how="left", on="name_norm", suffixes=("","_adp"))
+    merged.rename(columns={"AVG":"ADP","POS":"POS_ADP","Team":"Team_ADP"}, inplace=True)
+
+    merged["POS_FINAL"] = merged["POS"].combine_first(merged["position"]).fillna("")
+    merged["TEAM_FINAL"] = merged["Team_ADP"].combine_first(merged["team"]).fillna("")
+
+    merged["FPTS"] = pd.to_numeric(merged["FPTS"], errors="coerce")
+    merged = merged.dropna(subset=["FPTS"])
+
+    merged["injury_risk"] = compute_injury_risk(merged, inj)
+    merged["ADP"] = pd.to_numeric(merged["ADP"], errors="coerce")
+    merged["pos_fpts_z"] = merged.groupby("POS_FINAL")["FPTS"].transform(
+        lambda s: (s - s.mean())/s.std(ddof=0).replace(0,np.nan)
+    )
+
+    your_picks = compute_snake_picks(teams, rounds, slot)
+
+    rows = []
+    for _, row in merged.iterrows():
+        adp_rank = row["ADP"]
+        pos = row["POS_FINAL"]
+        fpts = row["FPTS"]
+        risk_score = row["injury_risk"]
+        if pd.isna(adp_rank):
+            adp_rank = 300 + (-row["pos_fpts_z"]*50 if pd.notna(row["pos_fpts_z"]) else 0)
+        avail_probs = [availability_probability(adp_rank, p) for p in your_picks]
+        best_round_i = int(np.argmax(avail_probs))
+        best_pick_num = your_picks[best_round_i]
+        prob_at_best = avail_probs[best_round_i]
+        upside = value_over_adp(fpts, pos, adp_rank)
+        label = categorize(risk_score, upside)
+
+        rows.append({
+            "Player": row.get("Player"),
+            "POS": pos,
+            "Team": row.get("TEAM_FINAL"),
+            "FPTS": round(fpts,1),
+            "ADP": round(adp_rank,1) if pd.notna(adp_rank) else None,
+            "BestPickNum": best_pick_num,
+            "ProbAvailAtBest": round(prob_at_best,3),
+            "InjuryRisk": round(risk_score,3),
+            "UpsideScore": round(upside,2),
+            "Tier": label
+        })
+    board = pd.DataFrame(rows)
+
+    rr = []
+    for r, pick in enumerate(your_picks, start=1):
+        board[f"ProbAvail_R{r}"] = board.apply(lambda x: availability_probability(x["ADP"] if pd.notna(x["ADP"]) else 300, pick), axis=1)
+        board[f"Priority_R{r}"] = board["FPTS"]*board[f"ProbAvail_R{r}"] - (board["InjuryRisk"]*10) + (np.maximum(board["UpsideScore"],0)/25.0)
+        top = board.sort_values(f"Priority_R{r}", ascending=False).head(targets_per_round)
+        t = top[["Player","POS","Team","FPTS","ADP","InjuryRisk","ProbAvailAtBest","Tier"]].copy()
+        t["Round"] = r
+        rr.append(t.assign(PickNumber=pick).reset_index(drop=True))
+    targets = pd.concat(rr, ignore_index=True)
+
+    meta = {
+        "your_picks": your_picks,
+        "timestamp": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    }
+    return board, targets, meta
+
+# ---------------------------- UI ---------------------------- #
+
+st.title("🏈 NFL Fantasy Draft Assistant")
+st.caption("Live projections + ADP + injuries → risk tiers, upside, and draft-order–aware targets.")
+
+with st.sidebar:
+    st.header("Settings")
+    teams = st.number_input("Teams in league", min_value=6, max_value=20, value=12, step=1)
+    rounds = st.number_input("Total rounds", min_value=10, max_value=30, value=16, step=1)
+    slot = st.number_input("Your draft slot (1-indexed)", min_value=1, max_value=int(teams), value=6, step=1)
+    targets_per_round = st.slider("Targets per round", min_value=5, max_value=25, value=12, step=1)
+    st.markdown("---")
+    refresh = st.button("🔄 Refresh Live Data (clear cache)")
+
+if refresh:
+    fetch_sleeper_players.clear()
+    fetch_fp_adp.clear()
+    fetch_fantasypros_projections.clear()
+    fetch_injuries.clear()
+
+with st.spinner("Building board from live sources…"):
+    board, targets, meta = build_data(int(teams), int(rounds), int(slot), int(targets_per_round))
+
+st.success(f"Ready. Last updated {meta['timestamp']}")
+
+tabs = st.tabs(["Round Targets", "Master Board", "By Position", "Export"])
+
+with tabs[0]:
+    c1, c2 = st.columns([2,1])
+    with c1:
+        st.subheader("Your Picks (Snake Order)")
+        st.write(meta["your_picks"])
+    with c2:
+        pick_round = st.number_input("Preview Round", min_value=1, max_value=int(rounds), value=1, step=1)
+    rt = targets.query("Round == @pick_round").copy()
+    st.caption("Ranked by priority (projection × availability − risk).")
+    st.dataframe(rt, use_container_width=True, hide_index=True)
+
+with tabs[1]:
+    st.subheader("Master Board")
+    st.caption("Filter by position/tier and sort by any column.")
+    pos_filter = st.multiselect("Positions", options=sorted(board["POS"].dropna().unique()), default=[])
+    tier_filter = st.multiselect("Tier", options=["Secure","Balanced","High Risk / High Return"], default=[])
+    filtered = board.copy()
+    if pos_filter:
+        filtered = filtered[filtered["POS"].isin(pos_filter)]
+    if tier_filter:
+        filtered = filtered[filtered["Tier"].isin(tier_filter)]
+    st.dataframe(filtered.sort_values(["Tier","FPTS"], ascending=[True, False]), use_container_width=True, hide_index=True)
+
+with tabs[2]:
+    st.subheader("Position Drilldown")
+    for pos in ["RB","WR","QB","TE"]:
+        st.markdown(f"**{pos}**")
+        view = board[board["POS"]==pos].sort_values("FPTS", ascending=False).head(50)
+        st.dataframe(view[["Player","Team","FPTS","ADP","InjuryRisk","UpsideScore","Tier"]], use_container_width=True, hide_index=True)
+
+with tabs[3]:
+    st.subheader("Export to Excel")
+    st.caption("Download the current board and round targets as an .xlsx file.")
+    try:
+        import io, xlsxwriter
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
+            board.to_excel(xw, index=False, sheet_name="MasterBoard")
+            targets.to_excel(xw, index=False, sheet_name="RoundTargets")
+        st.download_button("Download draft_board.xlsx", data=bio.getvalue(), file_name="draft_board.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        st.error("Install xlsxwriter to enable Excel export: pip install xlsxwriter")
+
+st.caption("Sources: FantasyPros (projections & ADP), NFL.com & ESPN (injuries), Sleeper (players). For stable paid feeds, swap in SportsDataIO/FantasyData.")'''
+
+reqs = """streamlit
+pandas
+numpy
+requests
+beautifulsoup4
+lxml
+xlsxwriter
+"""
+
+# Create the directory structure
+print("Creating directory structure...")
+print(f"Created directory: {base}")
+
+# Write the main app file
+with open(os.path.join(base, "app.py"), "w", encoding="utf-8") as f:
+    f.write(app_py)
+print("✓ Created app.py")
+
+# Write requirements file
+with open(os.path.join(base, "requirements.txt"), "w", encoding="utf-8") as f:
+    f.write(reqs)
+print("✓ Created requirements.txt")
+
+# Create zip file
+zip_path = "/mnt/data/NFL_Draft_Streamlit_App.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    z.write(os.path.join(base, "app.py"), arcname="app.py")
+    z.write(os.path.join(base, "requirements.txt"), arcname="requirements.txt")
+print(f"✓ Created zip file: {zip_path}")
+
+print("\n🏈 NFL Fantasy Draft Assistant created successfully!")
+print("\nFiles created:")
+print(f"- {base}/app.py")
+print(f"- {base}/requirements.txt") 
+print(f"- {zip_path}")
+
+print("\nTo run the application:")
+print("1. Extract the zip file")
+print("2. Install dependencies: pip install -r requirements.txt")
+print("3. Run the app: streamlit run app.py")
+
+print("\nFeatures included:")
+print("- Live data from FantasyPros, NFL.com, ESPN, and Sleeper API")
+print("- Snake draft pick calculator")
+print("- Injury risk assessment")
+print("- Player availability probability calculations")
+print("- Round-by-round draft targets")
+print("- Excel export functionality")
+print("- Interactive filtering and sorting")
